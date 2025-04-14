@@ -2,32 +2,33 @@
 Create Dataset Script
 
 Contains functions to download raw data, process it, and combine it into a single parquet file
+
+Usage: python create_dataset [config_name]
+- Runs the dataset creation (assumes spgc_raw.zip has been downloaded) for that config name
 '''
 
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import zipfile
-import logging 
 import gdown
+from datetime import datetime
+import time
+import os
+import sys
 
+from proj_logging import logger
 from tqdm.auto import tqdm
+from dataset_handling import get_config_metadata, write_config_metadata
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from pyspark import SparkConf
+from pyspark.sql.functions import udf, explode
+from pyspark.sql.types import ArrayType, StringType
 
 # Register `pandas.progress_apply` and `pandas.Series.map_apply` with `tqdm`
 # (can use `tqdm.gui.tqdm`, `tqdm.notebook.tqdm`, optional kwargs, etc.)
-tqdm.pandas(desc="my bar!")
+tqdm.pandas(desc="Dataset Progress")
 
-logger = logging.getLogger("dataset_logger")
-logger.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-# create formatter
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# add formatter to ch
-ch.setFormatter(formatter)
-# add ch to logger
-logger.addHandler(ch)
 
 def unzip_archive(file, output_path):
     with zipfile.ZipFile(file, "r") as zip_fp:
@@ -43,6 +44,7 @@ def process_metadata(metadata_path="data/spgc/metadata/metadata.csv"):
     '''
     Apply filters to the metadata to downselect to the best number of books
     '''
+    start = time.time()
     logger.info("Processing metadata...")
     df = pd.read_csv(metadata_path)
     # include English-only books (Leaves ~59633 and removes ~14910)
@@ -63,43 +65,56 @@ def process_metadata(metadata_path="data/spgc/metadata/metadata.csv"):
     book_counts = df.groupby('author_id')['book_id'].count()
     df = df[df['author_id'].isin(book_counts[book_counts > 1].index)]
     meta_df = df.drop(columns=['id', 'authoryearofbirth', 'authoryearofdeath', 'language', 'downloads', 'subjects', 'type', 'is_english']).reset_index(drop=True)
-    logger.info("Finished processing metadata...")
+    logger.info(f"Finished processing metadata (took {time.time() - start} seconds)")
     return meta_df
 
-def process_dataset(meta_df, data_dir="data/spgc/data/tokens"):
+def process_dataset(meta_df, data_dir="data/spgc/data/tokens", output_dir="data"):
     '''
     Process all the selected works in SPGC into a single Parquet file
     
     This will take a while. 
     '''
-    arr = [] # columns: author_id, book_id, tokens
+    conf = SparkConf().setMaster("local[*]").setAppName("SparkTFIDF").set('spark.driver.memory', '50G').set('spark.driver.maxResultSize', '20G')
+    
+    sc = SparkContext(conf=conf)
+    spark = SparkSession(sc)
     failed_arr = [] # array of book codes that could not be found
     CHUNK_SIZE = 500
-    def read_book(row):
-        # read in file
-        nonlocal arr
+    df = spark.createDataFrame(meta_df)
+
+    def read_book(pg_code):
+        '''
+        User-Defined Function (UDF) to read in the tokens and chunk them
+        '''
+        data_dir = "data/spgc/data/tokens"
         nonlocal failed_arr
         tokens = []
         try:
-            with open(f"{data_dir}/PG{row['pg_code']}_tokens.txt", 'r', encoding='utf-8') as fp:
+            with open(f"{data_dir}/PG{pg_code}_tokens.txt", 'r', encoding='utf-8') as fp:
                 tokens = fp.read().splitlines()
         except FileNotFoundError:
-            failed_arr.append(row['pg_code'])
-        
-        # split into N-sized chunks
-        token_chunks = [[row['author_id'], row['book_id'], ' '.join(tokens[i:(i + CHUNK_SIZE)])] for i in range(0, len(tokens), CHUNK_SIZE)]
-        arr += token_chunks
-        # logger.info(f"Processed book {row.name}")
-    meta_df.progress_apply(read_book, axis=1)
-    logger.info("Finished Processing Dataset")
-
-    data_df = pd.DataFrame(arr, columns=['author_id', 'book_id', 'text'])
-    tbl = pa.Table.from_pandas(data_df)
-    pq.write_table(tbl, 'data/dataset.parquet')
-
+            failed_arr.append(pg_code)
+    
+        return [' '.join(tokens[i:(i + CHUNK_SIZE)]) for i in range(0, len(tokens), CHUNK_SIZE)]
+    udf_read_book = udf(read_book, ArrayType(StringType()))
+    df = df.withColumn("text", explode(udf_read_book(df.pg_code)))
+    
+    logger.info("Finished processing dataset")
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info("Saving dataset...")
+    df.select('author_id', 'book_id', 'text').write.parquet( f'{output_dir}/dataset.parquet', mode='overwrite', partitionBy='author_id')
+    
+    # update metadata with current time
+    data = get_config_metadata(output_dir)
+    data[0] = int(time.mktime(datetime.now().timetuple()))
+    write_config_metadata(data, output_dir)
+    
     # remove missing records from metadata so only included books are recorded
     meta_df = meta_df[~meta_df['pg_code'].isin(failed_arr)].reset_index(drop=True)
-    meta_df.to_csv("data/metadata.csv", index=False)
+    meta_df.to_csv(f"{output_dir}/metadata.csv", index=False)
+    logger.info("Saved dataset, updated metadata")
+    spark.stop()
+
 
 if __name__ == "__main__":
     # code to download dataset
@@ -107,8 +122,14 @@ if __name__ == "__main__":
     # download_gdrive_file("1VJcL_0B-7YcAkaSTXnHOKXLa_EAbmpCK", "data/spgc_raw.zip")
     # unzip_archive("data/spgc_raw.zip", "data/spgc/")
     
-    # apply misc. filters to metadata to select certain works
+    # CONFIG_NAME = "primary_authors"
+    CONFIG_NAME = "all"
+    if len(sys.argv) == 2:
+        CONFIG_NAME = str(sys.argv[1])
+    logger.info(f"Creating dataset (config = '{CONFIG_NAME}')")
     meta_df = process_metadata()
-    
     # combine all three files into a single parquet file
-    process_dataset(meta_df)
+    if CONFIG_NAME == "primary_authors":
+        meta_df = meta_df[meta_df['author'].isin(['Leblanc, Maurice', 'Christie, Agatha', 'Chesterton, G. K. (Gilbert Keith)', 'Doyle, Arthur Conan'])]
+    
+    process_dataset(meta_df, output_dir=f"data/{CONFIG_NAME}")

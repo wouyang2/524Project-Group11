@@ -1,21 +1,42 @@
 '''
     Contains helper functions for loading, splitting, and modifying the dataset
 '''
-import logging
-import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
 import random
+import os
+from proj_logging import logger
 
-def load_dataset(data_path='data/dataset.parquet') -> pd.DataFrame:
+
+def load_dataset(config_name='all', data_dir="data") -> pd.DataFrame:
     '''
     Read in dataset from Parquet file
     '''
-    tbl = pq.ParquetFile(data_path)
-    return tbl.read().to_pandas()
+    return pq.read_table(f"{data_dir}/{config_name}/dataset.parquet").to_pandas()
+    # return pd.read_parquet(f"{data_dir}/{config_name}/dataset.parquet")
+
+def get_config_metadata(data_dir="data"):
+    '''
+    Gets the run metadata for a given run
+    '''
+    path = f"{data_dir}/run_dates.txt"
+    if os.path.exists(path):
+        with open(path, 'r') as fp:
+            return [int(x) for x in fp.readline().split()]
+    else:
+        return [-1, -1]
+
+def write_config_metadata(data, data_dir="data"):
+    '''
+    Writes run metadata
+    '''
+    path = f"{data_dir}/run_dates.txt"
+    with open(path, 'w') as fp:
+        fp.write(' '.join([str(x) for x in data]))
+        fp.write("\n")
 
 
-def book_train_test_split(df, test_size=0.2, margin_of_error=0.001) -> pd.DataFrame:
+def book_train_test_split(df, test_size=0.2, margin_of_error=0.001, initial_growth=1, growth=1) -> pd.DataFrame:
     '''
     "Splits" the dataset into train and test groups. 
 
@@ -45,11 +66,18 @@ def book_train_test_split(df, test_size=0.2, margin_of_error=0.001) -> pd.DataFr
         for author in count_df['author_id'].unique():
             # pick one random book
             num_books = count_df[count_df['author_id'] == author]['book_id'].max()
-            rand_book = random.randint(0, num_books)
-            book_row = count_df.loc[(count_df['author_id'] == author) & (count_df['book_id'] == rand_book)]
-            sub_df = pd.concat([sub_df, book_row])
+            n = 1
+            if num_books >= initial_growth:
+                n = initial_growth
+            else:
+                if initial_growth - 2 >= 0:
+                    n = initial_growth - 2
+            n = initial_growth if num_books > initial_growth else num_books - 1
+            for x in random.sample(range(0, num_books), n):
+            # rand_book = random.randint(0, num_books)
+                book_row = count_df.loc[(count_df['author_id'] == author) & (count_df['book_id'] == x)]
+                sub_df = pd.concat([sub_df, book_row])
         return sub_df
-    
     count_df = df.groupby(['author_id', 'book_id']).count().reset_index()
     sub_df = get_initial_split()
     initial_run = True
@@ -57,11 +85,13 @@ def book_train_test_split(df, test_size=0.2, margin_of_error=0.001) -> pd.DataFr
     ratio_range = (test_size - margin_of_error, test_size + margin_of_error)
     while processing:
         r = get_ratio(sub_df, count_df)
+        logger.debug(f"Ratio: {r:.4f} | CI: ({ratio_range[0]:.4f}, {ratio_range[1]:.4f})")
         if r > ratio_range[0] and r < ratio_range[1]:
+            logger.debug("Reached target ratio, exiting")
             processing = False # target reached, exit
         elif r < ratio_range[0]:  
             # too little data, add another random book
-            new_row = count_df[~(count_df.index.isin(sub_df.index))].sample(n=1)
+            new_row = count_df[~(count_df.index.isin(sub_df.index))].sample(n=growth)
             sub_df = pd.concat([sub_df, new_row])
             initial_run = False
         else:
@@ -70,9 +100,14 @@ def book_train_test_split(df, test_size=0.2, margin_of_error=0.001) -> pd.DataFr
                 # regen if this is the first run
                 sub_df = get_initial_split()
             else:
+                if growth > 1:
+                    growth -= 1
                 # take off random book
-                sub_df = sub_df[~(sub_df.index == sub_df.sample(n=1).index)]
+                book_to_remove = sub_df.sample(n=1)
+                if len(book_to_remove) == 1:
+                    sub_df = sub_df[~(sub_df.index.isin(book_to_remove.index))]
                 initial_run = False
+        
     train_elements = sub_df[['author_id', 'book_id']].apply(tuple, axis=1)
     df['is_train'] = df[['author_id', 'book_id']].apply(tuple, axis=1).isin(train_elements)
     return df
